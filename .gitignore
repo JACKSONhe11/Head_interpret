@@ -61,3 +61,6 @@ Thumbs.db
 # head_score_all/
 # viz_head_all/
 
+# Large data directories
+data_head/
+
