@@ -1,4 +1,6 @@
+# Head Interpret
 
+本项目提供了用于检测和分析 Transformer 模型中不同类型 attention heads 的工具。
 
 ## 环境配置
 
@@ -145,4 +147,121 @@ python head_recog.py \
     --save_path "head_score_all"
 ```
 
-#### 4
+#### 4. 使用 Pythia 模型检测 Iteration Head
+
+```bash
+python head_recog.py \
+    --use_pythia \
+    --pythia_model_name "EleutherAI/pythia-6.9b-deduped" \
+    --pythia_checkpoint "step3000" \
+    --head_type "iteration_head" \
+    --save_path "head_score_all"
+```
+
+#### 5. 检测 Pattern-based Heads（Previous Token, Duplicate, Induction）
+
+```bash
+# Previous Token Head
+python head_recog.py \
+    --model_name "meta-llama/Llama-2-7b-hf" \
+    --head_type "previous_token_head" \
+    --save_path "head_score_all"
+
+# Duplicate Token Head
+python head_recog.py \
+    --model_name "meta-llama/Llama-2-7b-hf" \
+    --head_type "duplicate_token_head" \
+    --save_path "head_score_all"
+
+# Induction Head
+python head_recog.py \
+    --model_name "meta-llama/Llama-2-7b-hf" \
+    --head_type "induction_head" \
+    --save_path "head_score_all"
+```
+
+#### 6. 检测 Truthfulness Head
+
+```bash
+python head_recog.py \
+    --model_name "meta-llama/Llama-2-7b-hf" \
+    --head_type "truthfulness_head" \
+    --save_path "head_score_all" \
+    --dataset_name "tqa_mc2" \
+    --num_fold 2 \
+    --num_heads 100
+```
+
+### 常用参数说明
+
+#### 基本参数
+
+- `--model_name`: 模型名称（默认: `meta-llama/Meta-Llama-3-8B-Instruct`）
+- `--head_type`: Head 类型（默认: `retrieval_head`）
+- `--save_path`: 结果保存路径（默认: `head_score_all`）
+- `--rerun` / `--no-rerun`: 是否重新运行（默认: `--rerun`）
+
+#### Retrieval Head 参数
+
+- `--s_len`: 起始长度（默认: 1000）
+- `--e_len`: 结束长度（默认: 5000）
+- `--context_lengths_num_intervals`: 上下文长度间隔数（默认: 20）
+- `--document_depth_percent_intervals`: 文档深度百分比间隔数（默认: 10）
+
+#### Truthfulness Head 参数
+
+- `--dataset_name`: 数据集名称（默认: `tqa_mc2`）
+- `--num_fold`: 交叉验证折数（默认: 2）
+- `--num_heads`: 选择的 top heads 数量（默认: 100）
+- `--seed`: 随机种子（默认: 42）
+- `--val_ratio`: 验证集比例（默认: 0.2）
+
+#### Pythia 模型参数
+
+- `--use_pythia`: 使用 Pythia 模型（需要与 `--pythia_checkpoint` 一起使用）
+- `--pythia_model_name`: Pythia 模型名称（默认: `EleutherAI/pythia-6.9b-deduped`）
+- `--pythia_checkpoint`: Pythia checkpoint revision（例如: `step3000`, `step10000`）
+
+### 输出结果
+
+检测结果会保存在 `save_path` 目录下，按模型名称组织：
+
+```
+head_score_all/
+├── Llama-2-7b-hf/
+│   ├── Llama-2-7b-hf_retrieval_head.json
+│   ├── Llama-2-7b-hf_previous_token_head_custom_abs.pt
+│   ├── Llama-2-7b-hf_duplicate_token_head_custom_abs.pt
+│   ├── Llama-2-7b-hf_induction_head_custom_abs.pt
+│   └── ...
+└── pythia-6.9b-deduped/
+    ├── pythia-6.9b-deduped_iteration_heads_inv_gt_0.70_sorted.npy
+    └── ...
+```
+
+### 在 Python 代码中使用
+
+```python
+from head_recog import detect_heads
+
+# 检测单个 head 类型
+heads = detect_heads(
+    model_name="meta-llama/Llama-2-7b-hf",
+    head_type="retrieval_head",
+    save_path="head_score_all"
+)
+# 返回: [(10, 5), (15, 10), (20, 15), ...]  # List of (layer_idx, head_idx)
+
+# 检测所有 head 类型
+all_results = detect_heads(
+    model_name="meta-llama/Llama-2-7b-hf",
+    head_type="all",
+    save_path="head_score_all"
+)
+# 返回: {"retrieval_head": [...], "iteration_head": [...], ...}
+
+```
+
+## 可视化
+
+可视化功能请参考 `viz_head_all/` 目录下的相关脚本。
