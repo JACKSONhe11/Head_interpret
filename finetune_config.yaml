@@ -1,0 +1,51 @@
+# LLaMA-2-7B-Chat-HF 微调配置文件
+
+# 模型配置
+model:
+  name: "meta-llama/Llama-2-7b-chat-hf"
+  max_length: 2048
+  dtype: "float16"  # 或 "bfloat16" 如果支持
+
+# LoRA 配置
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules:
+    - "q_proj"
+    - "v_proj" 
+    - "k_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# 训练配置
+training:
+  output_dir: "./llama2-finetuned"
+  num_train_epochs: 3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  warmup_steps: 100
+  logging_steps: 10
+  save_steps: 500
+  fp16: true
+  dataloader_pin_memory: false
+
+# 数据配置
+data:
+  max_seq_length: 512
+  instruction_template: |
+    <s>[INST] {instruction} [/INST] {response}</s>
+  
+# 示例训练数据格式
+example_data:
+  - instruction: "解释什么是人工智能"
+    response: "人工智能是计算机科学的一个分支，旨在创建能够执行通常需要人类智能的任务的系统。"
+  - instruction: "写一个Python函数计算阶乘"
+    response: "def factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n-1)"
+
+
+
+
