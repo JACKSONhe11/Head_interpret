@@ -20,6 +20,9 @@
     
     # 注意: truthfulness_head 需要先运行 get_activations 脚本生成激活值文件
 """
+
+
+
 import tqdm
 import pickle
 from datasets import load_dataset
@@ -91,11 +94,11 @@ def print_score_statistics(head_list: List[Tuple[Tuple[int, int], float]]) -> No
 
 def _load_model_with_args(model_name: str, args=None):
     """
-    根据 args 参数加载模型，支持 Pythia 模型和 checkpoint
+    根据 model_name 和 args 参数加载模型，支持 Pythia 模型和 checkpoint
     
     Args:
-        model_name: 默认模型名称
-        args: 参数对象，可能包含 use_pythia, pythia_checkpoint, pythia_model_name
+        model_name: 模型名称（根据 model_index 设置）
+        args: 参数对象，可能包含 pythia_checkpoint
     
     Returns:
         CustomModelAdapter 实例
@@ -105,23 +108,67 @@ def _load_model_with_args(model_name: str, args=None):
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 检查是否使用 Pythia
-    use_pythia = getattr(args, 'use_pythia', False) if args else False
-    if use_pythia:
-        pythia_model_name = getattr(args, 'pythia_model_name', 'EleutherAI/pythia-6.9b-deduped') if args else 'EleutherAI/pythia-6.9b-deduped'
+    # 根据 model_name 判断是否是 Pythia 模型
+    model_name_lower = model_name.lower()
+    is_pythia = "pythia" in model_name_lower
+    is_pythia_sft = "pythia-6.9b-sft" in model_name_lower or "ncgc/pythia" in model_name_lower
+    
+    if is_pythia:
+        # 获取 checkpoint 参数
         pythia_checkpoint = getattr(args, 'pythia_checkpoint', None) if args else None
         
-        if pythia_checkpoint is None:
-            raise ValueError("--pythia_checkpoint is required when --use_pythia is set")
+        if is_pythia_sft:
+            # SFT 模型通常不支持多个 checkpoint，只支持 main 分支
+            # 如果用户指定了 checkpoint（如 step143000），自动使用 main
+            if pythia_checkpoint and pythia_checkpoint != "main":
+                print(f"⚠️  Warning: SFT model ({model_name}) may not support checkpoint '{pythia_checkpoint}'.")
+                print(f"   Using 'main' branch instead. SFT models typically only have the 'main' branch.")
+                pythia_checkpoint = "main"
+            elif pythia_checkpoint is None:
+                pythia_checkpoint = "main"
+            
+            print(f"📦 Loading Pythia model (SFT): {model_name} (checkpoint: {pythia_checkpoint})")
+        else:
+            # 原始 Pythia 模型，需要指定 checkpoint
+            if pythia_checkpoint is None:
+                raise ValueError(
+                    f"--pythia_checkpoint is required for Pythia model '{model_name}'. "
+                    f"Valid checkpoints: step0, step1, step2, ..., step143000"
+                )
+            
+            print(f"📦 Loading Pythia model (original): {model_name} (checkpoint: {pythia_checkpoint})")
         
-        print(f"📦 Loading Pythia model: {pythia_model_name} (checkpoint: {pythia_checkpoint})")
-        model = CustomModelAdapter.from_pretrained(
-            pythia_model_name,
-            device=device,
-            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-            revision=pythia_checkpoint,
-        )
+        try:
+            model = CustomModelAdapter.from_pretrained(
+                model_name,
+                device=device,
+                torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+                revision=pythia_checkpoint,
+            )
+        except OSError as e:
+            if "is not a valid git identifier" in str(e) or "not a valid" in str(e):
+                if is_pythia_sft:
+                    # SFT 模型不支持该 checkpoint，尝试使用 main
+                    print(f"⚠️  Error: SFT model does not support checkpoint '{pythia_checkpoint}'.")
+                    print(f"   Retrying with 'main' branch...")
+                    pythia_checkpoint = "main"
+                    model = CustomModelAdapter.from_pretrained(
+                        model_name,
+                        device=device,
+                        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+                        revision=pythia_checkpoint,
+                    )
+                else:
+                    # 原始 Pythia 模型，提示用户检查 checkpoint
+                    raise ValueError(
+                        f"Invalid checkpoint '{pythia_checkpoint}' for model '{model_name}'. "
+                        f"Please check available checkpoints at https://huggingface.co/{model_name}. "
+                        f"For original Pythia models, valid checkpoints are: step0, step1, step2, ..., step143000"
+                    ) from e
+            else:
+                raise
     else:
+        # 非 Pythia 模型（Llama 等）
         print(f"📦 Loading model: {model_name}")
         model = CustomModelAdapter.from_pretrained(
             model_name,
@@ -191,6 +238,50 @@ def detect_heads(model_name: str, head_type: str, save_path: str = "head_score",
         return _detect_pattern_heads(model_name, head_type, save_path_with_model, args)
     elif head_type == "truthfulness_head":
         return _detect_truthfulness_heads(model_name, save_path_with_model, args)
+    elif head_type == "three":
+        three_head_types = [
+
+            "previous_token_head",
+            "duplicate_token_head",
+            "induction_head",
+        ]
+        results = {}
+        print(f"\n{'='*70}")
+        print(f"🔍 Running detection for ALL head types")
+        print(f"{'='*70}\n")
+        
+        for i, ht in enumerate(three_head_types, 1):
+            print(f"\n[{i}/{len(three_head_types)}] Detecting {ht}...")
+            print("-" * 70)
+            try:
+                # 复用主函数中已计算的 save_path_with_model
+                if ht == "retrieval_head":
+                    heads = _detect_retrieval_heads(model_name, save_path, save_path_with_model, args)
+                elif ht == "iteration_head":
+                    heads = _detect_iteration_heads(model_name, save_path_with_model, args)
+                elif ht == "truthfulness_head":
+                    heads = _detect_truthfulness_heads(model_name, save_path_with_model, args)
+                elif ht in ["duplicate_token_head", "induction_head", "previous_token_head"]:
+                    heads = _detect_pattern_heads(model_name, ht, save_path_with_model, args)
+                else:
+                    raise ValueError(f"Unknown head type: {ht}")
+                
+                results[ht] = heads
+                print(f"✅ {ht}: Found {len(heads)} heads")
+            except Exception as e:
+                print(f"❌ {ht}: Error - {e}")
+                results[ht] = []
+                import traceback
+                traceback.print_exc()
+        
+        print(f"\n{'='*70}")
+        print(f"✅ All head type detections completed!")
+        print(f"{'='*70}\n")
+        
+        # 返回所有结果（字典格式）
+        return results
+
+
     elif head_type == "all":
         # 运行所有 head 类型的检测
         all_head_types = [
@@ -456,28 +547,93 @@ def _detect_pattern_heads(model_name: str, head_type: str, save_path_with_model:
     model = _load_model_with_args(model_name, args)
     
     # 准备测试 prompts
-    # 根据 head 类型选择不同的 prompts 以获得更好的检测效果
-    if head_type == "duplicate_token_head":
-        # 对于 duplicate token head，使用包含重复内容的 prompts
-        prompts = [
-            "one two three one two three one two three",
-            "1 2 3 4 5 1 2 3 4 1 2 3 1 2 3 4 5 6 7",
-            "green ideas sleep furiously; green ideas don't sleep furiously"
-        ]
-    elif head_type == "induction_head":
-        # 对于 induction head，也使用包含重复模式的 prompts
-        prompts = [
-            "one two three one two three one two three",
-            "1 2 3 4 5 1 2 3 4 1 2 3 1 2 3 4 5 6 7",
-            "green ideas sleep furiously; green ideas don't sleep furiously"
-        ]
+    # 使用 prompt 生成器生成 prompts，超参数与 promt_generate.py 中的测试代码一致
+    try:
+        from promt_generate import generate_prompts
+    except ImportError as e:
+        raise ImportError(
+            f"Failed to import promt_generate module: {e}\n"
+            f"Please ensure promt_generate.py is in the same directory."
+        )
+    
+    # 检查是否使用 prompt 生成器
+    use_prompt_generator = getattr(args, 'use_prompt_generator', True) if args else True
+    
+    if use_prompt_generator:
+        # 使用 prompt 生成器
+        # 超参数设置（从 args 读取，如果没有则使用默认值）
+        max_length = args.prompt_max_length
+        min_length = args.prompt_min_length
+        interval = args.prompt_interval
+        length_per_interval = args.prompt_length_per_interval
+        
+        # 根据 head 类型生成对应的 prompts
+        if head_type == "duplicate_token_head":
+            # 对于 duplicate token head，使用包含重复内容的 prompts
+            prompts = generate_prompts(
+                head_type="duplicate_token_head",
+                max_length=max_length,
+                min_length=min_length,
+                interval=interval,
+                length_per_interval=length_per_interval
+            )
+        elif head_type == "induction_head":
+            # 对于 induction head，也使用包含重复模式的 prompts
+            prompts = generate_prompts(
+                head_type="induction_head",
+                max_length=max_length,
+                min_length=min_length,
+                interval=interval,
+                length_per_interval=length_per_interval
+            )
+        elif head_type == "previous_token_head":
+            # 对于 previous_token_head，使用通用 prompts
+            prompts = generate_prompts(
+                head_type="previous_token_head",
+                max_length=max_length,
+                min_length=min_length,
+                interval=interval,
+                length_per_interval=length_per_interval
+            )
+        else:
+            # 对于其他类型，使用 previous_token_head 的 prompts 作为默认
+            prompts = generate_prompts(
+                head_type="previous_token_head",
+                max_length=max_length,
+                min_length=min_length,
+                interval=interval,
+                length_per_interval=length_per_interval
+            )
     else:
-        # 对于 previous_token_head 和其他类型，使用通用 prompts
-        prompts = [
-            "The head detector feature for TransformerLens allows users to check for various common heads automatically, reducing the cost of discovery.",
-            "Machine learning models require careful evaluation to ensure they perform well on unseen data.",
-            "Attention mechanisms in transformers allow models to focus on relevant parts of the input sequence."
-        ]
+        # 使用原来的硬编码 prompts
+        if head_type == "duplicate_token_head":
+            # 对于 duplicate token head，使用包含重复内容的 prompts
+            prompts = [
+                "one two three one two three one two three",
+                "1 2 3 4 5 1 2 3 4 1 2 3 1 2 3 4 5 6 7",
+                "green ideas sleep furiously; green ideas don't sleep furiously"
+            ]
+        elif head_type == "induction_head":
+            # 对于 induction head，也使用包含重复模式的 prompts
+            prompts = [
+                "one two three one two three one two three",
+                "1 2 3 4 5 1 2 3 4 1 2 3 1 2 3 4 5 6 7",
+                "green ideas sleep furiously; green ideas don't sleep furiously"
+            ]
+        elif head_type == "previous_token_head":
+            # 对于 previous_token_head 和其他类型，使用通用 prompts
+            prompts = [
+                "The head detector feature for TransformerLens allows users to check for various common heads automatically, reducing the cost of discovery.",
+                "Machine learning models require careful evaluation to ensure they perform well on unseen data.",
+                "Attention mechanisms in transformers allow models to focus on relevant parts of the input sequence."
+            ]
+        else:
+            # 对于其他类型，使用 previous_token_head 的 prompts 作为默认
+            prompts = [
+                "The head detector feature for TransformerLens allows users to check for various common heads automatically, reducing the cost of discovery.",
+                "Machine learning models require careful evaluation to ensure they perform well on unseen data.",
+                "Attention mechanisms in transformers allow models to focus on relevant parts of the input sequence."
+            ]
     
     # 检测 heads
     print(f"🔍 Detecting {head_type}...")
@@ -901,7 +1057,9 @@ def _detect_truthfulness_heads(model_name: str, save_path_with_model: str = "hea
     num_heads = model.config.num_attention_heads
     hidden_size = model.config.hidden_size
     head_dim = hidden_size // num_heads
-    num_key_value_heads = model.config.num_key_value_heads
+    # num_key_value_heads may not exist for older models (e.g., GPTNeoX)
+    # Default to num_heads if not present (no grouping)
+    num_key_value_heads = getattr(model.config, 'num_key_value_heads', num_heads)
     num_key_value_groups = num_heads // num_key_value_heads
 
     # load activations 
@@ -1119,7 +1277,13 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, required=False,default="meta-llama/Meta-Llama-3-8B-Instruct")
+    # NOTE:
+    # - 如果用户显式传入 --model_name，则优先使用该值
+    # - 否则使用 --model_index 映射的默认模型
+    # - 其中 model_index=4 对应原始 Pythia 模型 EleutherAI/pythia-6.9b-deduped（需提供 stepXXXX checkpoint）
+    parser.add_argument("--model_name", type=str, required=False, default=None)
+    parser.add_argument("--model_index", type=int, required=False, default=1,
+                       help="Model index to use: 1=Meta-Llama-3-8B-Instruct, 2=Llama-2-7b-hf, 3=ncgc/pythia-6.9b-sft, 4=EleutherAI/pythia-6.9b-deduped")
     parser.add_argument("--head_type", type=str, required=False, default="retrieval_head",
                        help="Head type to detect: retrieval_head, previous_token_head, "
                             "duplicate_token_head/duplicate_head, induction_head, iteration_head, "
@@ -1147,47 +1311,69 @@ if __name__ == "__main__":
     parser.add_argument('--use_random_dir', action='store_true', help='use random direction', default=False)
     parser.add_argument("--num_heads", type=int, default=100, help='K, number of top heads to select')
     
-    # Pythia 模型支持
-    parser.add_argument("--use_pythia", action='store_true', default=False,
-                       help="Use Pythia model instead of the model specified in model_name")
-    parser.add_argument("--pythia_checkpoint", type=str, default=None,
-                       help="Pythia checkpoint revision (e.g., 'step3000', 'step10000'). Required if --use_pythia is set")
-    parser.add_argument("--pythia_model_name", type=str, default="EleutherAI/pythia-6.9b-deduped",
-                       help="Pythia model name (default: EleutherAI/pythia-6.9b-deduped)")
+    # Pythia 模型支持（通过 model_index 控制）
+    # - model_index=3: SFT 版本 ncgc/pythia-6.9b-sft（默认 checkpoint=main）
+    # - model_index=4: 原始 Pythia 模型 EleutherAI/pythia-6.9b-deduped（需要显式提供 stepXXXX checkpoint）
+    parser.add_argument("--pythia_checkpoint", type=str, default= None,
+                       help="Pythia checkpoint revision (e.g., 'step3000', 'step10000', 'step143000', 'main'). "
+                            "Required for original Pythia models. For SFT models (model_index=3), defaults to 'main'. "
+                            "Maximum for original Pythia: step143000")
+
+    # prompt generate
+    parser.add_argument("--use_prompt_generator", action='store_true', default=True,
+                       help="Use prompt generator to generate prompts (default: True)")
+    parser.add_argument("--no_use_prompt_generator", dest='use_prompt_generator', action='store_false',
+                       help="Use original hardcoded prompts instead of generator")
+    parser.add_argument("--prompt_max_length", type=int, default=200,
+                       help="Maximum prompt length for prompt generation (default: 100)")
+    parser.add_argument("--prompt_min_length", type=int, default=10,
+                       help="Minimum prompt length for prompt generation (default: 10)")
+    parser.add_argument("--prompt_interval", type=int, default=10,
+                       help="Interval between prompt lengths for prompt generation (default: 10)")
+    parser.add_argument("--prompt_length_per_interval", type=int, default=10,
+                       help="Number of prompts per interval length (default: 5)")
+
+
 
 
     args = parser.parse_args()
+    print("all prompt number for three_head detection:", args.prompt_max_length // args.prompt_interval * args.prompt_length_per_interval)
+
+
+    if args.model_name is None:
+        if args.model_index == 1:
+            args.model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+        elif args.model_index == 2:
+            args.model_name = "meta-llama/Llama-2-7b-hf"
+        elif args.model_index == 3:
+            # SFT 版本 Pythia
+            args.model_name = "ncgc/pythia-6.9b-sft"
+            if args.pythia_checkpoint is None:
+                args.pythia_checkpoint = "main"
+        elif args.model_index == 4:
+            # 原始 Pythia 模型（需要显式提供 stepXXXX checkpoint）
+            args.model_name = "EleutherAI/pythia-6.9b-deduped"
+            if args.pythia_checkpoint is None:
+                raise ValueError(
+                    "--pythia_checkpoint is required when using model_index=4 (EleutherAI/pythia-6.9b-deduped). "
+                    "Example: --pythia_checkpoint step143000"
+                )
+        else:
+            raise ValueError(f"Invalid model index: {args.model_index}. Valid values: 1, 2, 3, 4")
+
     
-    # 如果 data_dir 不存在，创建它
+
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
         data_dir.mkdir(parents=True, exist_ok=True)
         print(f"📁 Created data directory: {data_dir}")
-    #model choise: Llama-2-7b-hf or Meta-Llama-3-8B-Instruct 
-    # args.model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-    # args.model_name = "meta-llama/Llama-2-7b-hf"
+    
+    
+    # 如果使用 Pythia 模型（model_index=3），打印信息
+    if "pythia" in str(args.model_name).lower():
+        print(f"🔄 Using Pythia model: {args.model_name} (checkpoint: {args.pythia_checkpoint})")
+    
 
-    # # 如果使用 Pythia，更新 model_name
-    # args.use_pythia = True
-
-
-    # args.pythia_checkpoint = "step3000"
-    # args.head_type = "iteration_head"
-    # args.head_type = "all"
-    # args.s_len = 10
-    # args.e_len = 50
-    # args.context_lengths_num_intervals = 2
-    # args.document_depth_percent_intervals = 2
-    if args.use_pythia:
-        if args.pythia_checkpoint is None:
-            raise ValueError("--pythia_checkpoint is required when --use_pythia is set")
-        # 更新 model_name 为 Pythia 模型名称，用于保存路径等
-        args.model_name = args.pythia_model_name
-        print(f"🔄 Using Pythia model: {args.pythia_model_name} (checkpoint: {args.pythia_checkpoint})")
-    else:
-        #model choise: Llama-2-7b-hf or Meta-Llama-3-8B-Instruct 
-        # args.model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-        args.model_name = "meta-llama/Llama-2-7b-hf"
 
     print("head_type: ", args.head_type)
     try:

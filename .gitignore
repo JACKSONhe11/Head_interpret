@@ -56,11 +56,16 @@ Thumbs.db
 # *.pkl
 # *.pickle
 
-# Results and outputs (uncomment if you don't want to track)
-# results/
-# head_score_all/
-# viz_head_all/
+# Results and outputs (excluded from Git)
+results/
+head_score_all/
+contexts/
+splits/
 
 # Large data directories
 data_head/
+
+# Excluded files and directories
+viz_head_all/
+downstream.py
 

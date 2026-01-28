@@ -227,8 +227,6 @@ class LLMNeedleHaystackTester:
         else:
             self.block_list = []
 
-        print(self.block_list)
-        exit()
 
     def logistic(self, x, L=100, x0=50, k=.1):
         if x == 0:
@@ -573,3 +571,582 @@ if __name__ == "__main__":
                                  )
 
     ht.start_test(args)
+
+
+def generate_with_masked_heads(model, prompt, topk=0, max_new_tokens=50, head_score_file=None, random_mask=False, ground_truth=None, head_type=None):
+    """
+    简化的函数：使用屏蔽注意力头的方式生成回答并计算性能指标
+    
+    Args:
+        model: 模型对象或模型路径（字符串）
+        prompt: 输入提示文本
+        topk: 要屏蔽的注意力头数量
+            - topk > 0: 屏蔽topk个最重要的检索头
+            - topk = 0: 不屏蔽任何头
+            - topk < 0: 随机屏蔽|topk|个头（需要设置random_mask=True）
+        max_new_tokens: 最大生成token数，默认50
+        head_score_file: head_score文件路径（如果为None，则从head_score_dir推断）
+        random_mask: 如果为True且topk<0，则随机屏蔽|topk|个头
+        ground_truth: 期望的答案文本，用于计算性能指标（ROUGE score）
+    
+    Returns:
+        dict: 包含以下键的字典
+            - 'response': 模型生成的回答文本
+            - 'blocked_heads': 被屏蔽的注意力头列表 [(layer, head), ...]
+            - 'generation_time': 生成耗时（秒）
+            - 'score': ROUGE-1 recall分数（0-100），如果提供了ground_truth；否则为None
+            - 'rouge1_recall': ROUGE-1 recall分数（0-100）
+            - 'rouge1_precision': ROUGE-1 precision分数（0-100）
+            - 'rouge1_fmeasure': ROUGE-1 F-measure分数（0-100）
+            - 'rougeL_recall': ROUGE-L recall分数（0-100）
+    
+    Example:
+        >>> # 使用模型路径
+        >>> result = generate_with_masked_heads(
+        ...     model="meta-llama/Meta-Llama-3-8B-Instruct",
+        ...     prompt="What is the capital of France?",
+        ...     topk=10  # 屏蔽top-10个检索头
+        ... )
+        >>> print(result['response'])
+        >>> print(f"Blocked heads: {result['blocked_heads']}")
+        
+        >>> # 使用已加载的模型对象
+        >>> from transformers import AutoModelForCausalLM
+        >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+        >>> result = generate_with_masked_heads(
+        ...     model=model,
+        ...     prompt="Tell me a story.",
+        ...     topk=5
+        ... )
+    """
+    import time
+    from model_adapter import CustomModelAdapter
+    
+    # 1. 处理模型输入（可能是路径或模型对象）
+    if isinstance(model, str):
+        # 如果是字符串，使用 CustomModelAdapter 加载模型
+        model_name = model
+        model_version = model_name.split('/')[-1]
+        
+        print(f"📦 Loading model: {model_name}")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_obj = CustomModelAdapter.from_pretrained(
+            model_name,
+            device=device,
+            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+            use_flash_attention_2=False,  # CustomModelAdapter 内部会处理
+        )
+        
+        # 获取 tokenizer（CustomModelAdapter 已经包含了 tokenizer）
+        tokenizer = model_obj.tokenizer
+        
+        # 处理特殊模型（如果需要）
+        if 'llama-2-7b-80k' in model_version:
+            scaling_factor = 10
+            reset_rope(model_obj._model, model_max_train_len=81920, scaling_factor=scaling_factor)
+    else:
+        # 如果已经是模型对象
+        # 检查是否是 CustomModelAdapter
+        if isinstance(model, CustomModelAdapter):
+            model_obj = model
+            # CustomModelAdapter 已经有 tokenizer
+            tokenizer = model_obj.tokenizer
+            # 从 model 获取 model_name
+            if hasattr(model_obj, '_model'):
+                underlying_model = model_obj._model
+                if hasattr(underlying_model, 'name_or_path'):
+                    model_name = underlying_model.name_or_path
+                elif hasattr(underlying_model, 'config') and hasattr(underlying_model.config, 'name_or_path'):
+                    model_name = underlying_model.config.name_or_path
+                else:
+                    model_name = getattr(model_obj, 'name_or_path', 'unknown')
+            else:
+                model_name = getattr(model_obj, 'name_or_path', 'unknown')
+        else:
+            # 如果不是 CustomModelAdapter，尝试包装它
+            print("⚠️  Model is not a CustomModelAdapter, wrapping it...")
+            model_obj = CustomModelAdapter(model)
+            tokenizer = model_obj.tokenizer
+            # 尝试获取 model_name
+            if hasattr(model, 'name_or_path'):
+                model_name = model.name_or_path
+            elif hasattr(model, 'config') and hasattr(model.config, 'name_or_path'):
+                model_name = model.config.name_or_path
+            else:
+                model_name = 'unknown'
+        
+        model_version = model_name.split('/')[-1]
+    
+    # 2. 处理模型版本名称（用于加载head_score文件）
+    if model_version == 'Mistral-7B-Instruct-v0.2':
+        model_version = "Mistral-7B-v0.2-hf"
+    
+    # 3. 准备block_list（要屏蔽的注意力头）
+    block_list = None
+    blocked_heads = []
+    
+    if topk != 0:
+        if topk > 0:
+            # 屏蔽topk个最重要的检索头
+            # 如果提供了head_score_file，使用它；否则从默认路径推断
+            if head_score_file is None:
+                head_score_dir = "head_score_all"  # 默认目录
+                head_score_file = f"{head_score_dir}/{model_version}/{model_version}_retrieval_head.json"
+                # 如果不存在，尝试旧格式
+                if not os.path.exists(head_score_file):
+                    head_score_file = f"{head_score_dir}/{model_version}.json"
+            
+            if not os.path.exists(head_score_file):
+                raise FileNotFoundError(
+                    f"Head score file not found: {head_score_file}\n"
+                    f"Please run head detection first or provide correct head_score_file path."
+                )
+            
+            with open(head_score_file, "r") as file:
+                stable_block_list = json.loads(file.readline())
+            
+            stable_block_list = [(l[0], np.mean(l[1])) for l in stable_block_list.items()]
+            stable_block_list = sorted(stable_block_list, key=lambda x: x[1], reverse=True)
+            all_heads = [[int(ll) for ll in l[0].split("-")] for l in stable_block_list][:100]
+            block_list = all_heads[:topk]
+            blocked_heads = block_list.copy()
+            print(f"Masking out top {topk} retrieval heads: {blocked_heads}")
+            
+        elif topk < 0 and random_mask:
+            # 随机屏蔽|topk|个头
+            if isinstance(model, str):
+                config = AutoConfig.from_pretrained(model_name)
+            elif isinstance(model_obj, CustomModelAdapter):
+                # CustomModelAdapter 包装了模型，访问底层模型的 config
+                config = model_obj._model.config
+            else:
+                config = model_obj.config
+            num_layers = config.num_hidden_layers
+            num_heads = config.num_attention_heads
+            
+            # 生成所有可能的(layer, head)组合
+            all_possible_heads = [(l, h) for l in range(num_layers) for h in range(num_heads)]
+            # 随机选择
+            results = random.sample(all_possible_heads, min(abs(topk), len(all_possible_heads)))
+            block_list = results
+            blocked_heads = block_list.copy()
+            print(f"Masking out random {abs(topk)} heads: {blocked_heads}")
+    
+    # 4. 处理prompt
+    # 检查是否是chat格式
+    if model_version in ["Mistral-7B-Instruct-v0.2", "Qwen1.5-14B-Chat"]:
+        chat_prompt = [
+            {"role": "user", "content": prompt}
+        ]
+        input_ids = tokenizer.apply_chat_template(
+            conversation=chat_prompt, 
+            tokenize=True, 
+            add_generation_prompt=True, 
+            return_tensors='pt'
+        )
+    else:
+        input_ids = tokenizer(prompt, return_tensors="pt")['input_ids']
+    
+    # 5. 移动到正确的设备
+    # CustomModelAdapter 包装了模型，需要访问底层模型
+    if isinstance(model_obj, CustomModelAdapter):
+        underlying_model = model_obj._model
+        if hasattr(underlying_model, 'device'):
+            device = underlying_model.device
+        else:
+            device = next(underlying_model.parameters()).device
+    else:
+        if hasattr(model_obj, 'device'):
+            device = model_obj.device
+        else:
+            device = next(model_obj.parameters()).device
+    input_ids = input_ids.to(device)
+    
+    # 6. 生成回答
+    start_time = time.time()
+    
+    with torch.no_grad():
+        # 获取底层模型（CustomModelAdapter 包装了模型）
+        if isinstance(model_obj, CustomModelAdapter):
+            actual_model = model_obj._model
+        else:
+            actual_model = model_obj
+        
+        # 先处理输入（除了最后一个token）
+        q_outputs = actual_model(input_ids=input_ids[:, :-1], use_cache=True, return_dict=True)
+        
+        # 解码生成
+        output = []
+        past_kv = q_outputs.past_key_values
+        inp = input_ids[:, -1]
+        
+        for step_i in range(max_new_tokens):
+            inp = inp.view(1, 1)
+            outputs = actual_model(
+                input_ids=inp, 
+                past_key_values=past_kv, 
+                use_cache=True,
+                output_attentions=False, 
+                block_list=block_list
+            )
+            past_kv = outputs.past_key_values
+            inp = outputs.logits[0, -1].argmax()
+            step_token = tokenizer.convert_ids_to_tokens(inp.item())
+            output.append(inp.item())
+            
+            # 检查停止条件
+            if step_token == '<0x0A>' or inp.item() == 144:
+                break
+    
+    # 解码输出
+    response = tokenizer.decode(output, skip_special_tokens=True).strip()
+    
+    end_time = time.time()
+    generation_time = end_time - start_time
+    
+    # 计算性能指标（如果提供了ground_truth）
+    result = {
+        'response': response,
+        'blocked_heads': blocked_heads,
+        'generation_time': generation_time
+    }
+    
+    if ground_truth is not None:
+        # 计算ROUGE分数
+        rouge_scores = scorer.score(ground_truth, response)
+        result['score'] = rouge_scores['rouge1'].recall * 100  # 与retrieval_head_detection.py保持一致
+        result['rouge1_recall'] = rouge_scores['rouge1'].recall * 100
+        result['rouge1_precision'] = rouge_scores['rouge1'].precision * 100
+        result['rouge1_fmeasure'] = rouge_scores['rouge1'].fmeasure * 100
+        result['rougeL_recall'] = rouge_scores['rougeL'].recall * 100
+    else:
+        result['score'] = None
+        result['rouge1_recall'] = None
+        result['rouge1_precision'] = None
+        result['rouge1_fmeasure'] = None
+        result['rougeL_recall'] = None
+    
+    return result
+
+
+def evaluate_with_masked_heads_multiple_augments(
+    model, 
+    needle, 
+    haystack_dir,
+    retrieval_question,
+    ground_truth,
+    topk=0,
+    max_new_tokens=50,
+    head_score_file=None,
+    context_lengths_min=1000,
+    context_lengths_max=5000,
+    context_lengths_num_intervals=5,
+    document_depth_percent_min=0,
+    document_depth_percent_max=100,
+    document_depth_percent_intervals=5,
+    final_context_length_buffer=200,
+    model_provider="LLaMA"
+):
+    """
+    对同一个needle进行多次augment测试（不同的上下文长度和插入深度）
+    类似于 retrieval_head_detection.py 中的实现
+    
+    Args:
+        model: 模型对象或模型路径（字符串）
+        needle: 要插入到haystack中的目标信息（needle）
+        haystack_dir: haystack文件所在目录（包含.txt文件）
+        retrieval_question: 检索问题
+        ground_truth: 期望的答案文本，用于计算性能指标
+        topk: 要屏蔽的注意力头数量
+        max_new_tokens: 最大生成token数
+        head_score_file: head_score文件路径
+        random_mask: 是否随机屏蔽头
+        context_lengths_min: 最小上下文长度
+        context_lengths_max: 最大上下文长度
+        context_lengths_num_intervals: 上下文长度间隔数
+        document_depth_percent_min: 最小插入深度百分比
+        document_depth_percent_max: 最大插入深度百分比
+        document_depth_percent_intervals: 插入深度间隔数
+        final_context_length_buffer: 上下文长度缓冲区
+        model_provider: 模型提供商
+    
+    Returns:
+        dict: 包含以下键的字典
+            - 'results': 每个augment的结果列表，每个元素包含：
+                - 'context_length': 上下文长度
+                - 'depth_percent': 插入深度百分比
+                - 'score': ROUGE-1 recall分数
+                - 'response': 模型回答
+                - 'generation_time': 生成耗时
+            - 'average_score': 所有augment的平均分数
+            - 'success_count': 成功次数（score > 50）
+            - 'total_count': 总测试次数
+            - 'blocked_heads': 被屏蔽的头列表
+    """
+    import time
+    import glob
+    from model_adapter import CustomModelAdapter
+    
+    # 1. 加载模型和tokenizer（复用generate_with_masked_heads的逻辑）
+    if isinstance(model, str):
+        print(f"model: {model}")
+        model_name = model
+        model_version = model_name.split('/')[-1]
+        print(f"📦 Loading model: {model_name}")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_obj = CustomModelAdapter.from_pretrained(
+            model_name,
+            device=device,
+            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+            use_flash_attention_2=False,
+        )
+        tokenizer = model_obj.tokenizer
+    else:
+        if isinstance(model, CustomModelAdapter):
+            print(f"model is a CustomModelAdapter")
+            model_obj = model
+            tokenizer = model_obj.tokenizer
+            if hasattr(model_obj, '_model'):
+                underlying_model = model_obj._model
+                if hasattr(underlying_model, 'name_or_path'):
+                    model_name = underlying_model.name_or_path
+                else:
+                    model_name = getattr(model_obj, 'name_or_path', 'unknown')
+            else:
+                model_name = getattr(model_obj, 'name_or_path', 'unknown')
+        else:
+            print(f"model is not a CustomModelAdapter")
+            model_obj = CustomModelAdapter(model)
+            tokenizer = model_obj.tokenizer
+            if hasattr(model, 'name_or_path'):
+                model_name = model.name_or_path
+            else:
+                model_name = 'unknown'
+        model_version = model_name.split('/')[-1]
+    
+    # 2. 准备block_list
+    block_list = None
+    blocked_heads = []
+    
+    if topk == 0:
+        # topk=0: 不屏蔽任何头，正常生成
+        print("No heads will be masked (topk=0)")
+    elif topk != 0:
+        if topk > 0:
+            # 屏蔽topk个最重要的检索头
+            if head_score_file is None:
+                head_score_dir = "head_score_all"
+                head_score_file = f"{head_score_dir}/{model_version}/{model_version}_retrieval_head.json"
+                if not os.path.exists(head_score_file):
+                    head_score_file = f"{head_score_dir}/{model_version}.json"
+            
+            if not os.path.exists(head_score_file):
+                raise FileNotFoundError(
+                    f"Head score file not found: {head_score_file}\n"
+                    f"Please run head detection first or provide correct head_score_file path."
+                )
+            
+            with open(head_score_file, "r") as file:
+                stable_block_list = json.loads(file.readline())
+            stable_block_list = [(l[0], np.mean(l[1])) for l in stable_block_list.items()]
+            stable_block_list = sorted(stable_block_list, key=lambda x: x[1], reverse=True)
+            all_heads = [[int(ll) for ll in l[0].split("-")] for l in stable_block_list][:100]
+            block_list = all_heads[:topk]
+            blocked_heads = block_list.copy()
+            print(f"Masking out top {topk} retrieval heads: {blocked_heads}")
+            
+        elif topk < 0 :
+            # 随机屏蔽|topk|个头
+            if isinstance(model, str):
+                config = AutoConfig.from_pretrained(model_name)
+            elif isinstance(model_obj, CustomModelAdapter):
+                # CustomModelAdapter 包装了模型，访问底层模型的 config
+                config = model_obj._model.config
+            else:
+                config = model_obj.config
+            num_layers = config.num_hidden_layers
+            num_heads = config.num_attention_heads
+            
+            # 生成所有可能的(layer, head)组合
+            all_possible_heads = [(l, h) for l in range(num_layers) for h in range(num_heads)]
+            # 随机选择
+            results = random.sample(all_possible_heads, min(abs(topk), len(all_possible_heads)))
+            block_list = results
+            blocked_heads = block_list.copy()
+            print(f"Masking out random {abs(topk)} heads: {blocked_heads}")
+    
+    # 3. 生成上下文长度和深度百分比列表
+    context_lengths = np.round(np.linspace(
+        context_lengths_min, context_lengths_max, 
+        num=context_lengths_num_intervals, endpoint=True
+    )).astype(int)
+    
+    document_depth_percents = np.round(np.linspace(
+        document_depth_percent_min, document_depth_percent_max,
+        num=document_depth_percent_intervals, endpoint=True
+    )).astype(int)
+    
+    # 4. 读取haystack文件
+    print(f"📖 Reading haystack files from: {haystack_dir}")
+    
+    # 检查目录是否存在
+    if not os.path.exists(haystack_dir):
+        raise ValueError(
+            f"Haystack directory not found: {haystack_dir}\n"
+            f"Please create the directory and add .txt files, or use an existing haystack directory.\n"
+            f"Example: Create './haystack_for_detect' directory with .txt files inside."
+        )
+    
+    haystack_context = ""
+    max_context_length = max(context_lengths)
+    
+    # 首先尝试在目录下直接查找 .txt 文件
+    files = glob.glob(f"{haystack_dir}/*.txt")
+    
+    # 如果没找到，尝试在子目录中查找（递归）
+    if not files:
+        files = glob.glob(f"{haystack_dir}/**/*.txt", recursive=True)
+    
+    # 如果还是没找到，尝试查找 part1, part2, part3 等子目录
+    if not files:
+        for subdir in ["part1", "part2", "part3"]:
+            subdir_path = os.path.join(haystack_dir, subdir)
+            if os.path.exists(subdir_path):
+                subdir_files = glob.glob(f"{subdir_path}/*.txt")
+                files.extend(subdir_files)
+    
+    if not files:
+        raise ValueError(
+            f"No .txt files found in {haystack_dir} or its subdirectories\n"
+            f"Please add .txt files to the directory. The directory exists but contains no .txt files.\n"
+            f"Tried: {haystack_dir}/*.txt and {haystack_dir}/**/*.txt"
+        )
+    
+    print(f"   Found {len(files)} .txt file(s)")
+    
+    for file in files:
+        try:
+            with open(file, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read().strip()
+                if content:
+                    haystack_context += content + "\n"
+        except Exception as e:
+            print(f"⚠️  Error reading {file}: {e}")
+    
+    # 5. 对每个组合进行测试
+    all_results = []
+    total_tasks = len(context_lengths) * len(document_depth_percents)
+    current_task = 0
+    
+    print(f"\n📊 Total augments: {total_tasks} (Context lengths: {len(context_lengths)}, Depths: {len(document_depth_percents)})")
+    print("-" * 70)
+    
+    for context_length in context_lengths:
+        for depth_percent in document_depth_percents:
+            current_task += 1
+            print(f"\n[{current_task}/{total_tasks}] Context={context_length}, Depth={depth_percent}%")
+            
+            # 生成augmented context
+            # 截断haystack到指定长度
+            tokens_haystack = tokenizer.encode(haystack_context)
+            if len(tokens_haystack) > context_length - final_context_length_buffer:
+                tokens_haystack = tokens_haystack[:context_length - final_context_length_buffer]
+                truncated_haystack = tokenizer.decode(tokens_haystack)
+            else:
+                truncated_haystack = haystack_context
+            
+            # 插入needle
+            tokens_needle = tokenizer.encode(needle, add_special_tokens=False)
+            tokens_context = tokenizer.encode(truncated_haystack, add_special_tokens=False)
+            
+            actual_context_length = context_length - final_context_length_buffer
+            if len(tokens_context) + len(tokens_needle) > actual_context_length:
+                tokens_context = tokens_context[:actual_context_length - len(tokens_needle)]
+            
+            if depth_percent == 100:
+                tokens_new_context = tokens_context + tokens_needle
+            else:
+                insertion_point = int(len(tokens_context) * (depth_percent / 100))
+                # 找到句子边界
+                period_tokens = tokenizer.encode('.', add_special_tokens=False)
+                tokens_new_context = tokens_context[:insertion_point]
+                while tokens_new_context and tokens_new_context[-1] not in period_tokens:
+                    insertion_point -= 1
+                    tokens_new_context = tokens_context[:insertion_point]
+                tokens_new_context += tokens_needle + tokens_context[insertion_point:]
+            
+            context = tokenizer.decode(tokens_new_context)
+            
+            # 构建prompt
+            question = f"Based on the content of the book, Question: {retrieval_question}\nAnswer:"
+            if model_version in ["Mistral-7B-Instruct-v0.2", "Qwen1.5-14B-Chat"]:
+                chat_prompt = [{"role": "user", "content": f"<book>{context}</book>\n{question}"}]
+                input_ids = tokenizer.apply_chat_template(
+                    conversation=chat_prompt, tokenize=True, 
+                    add_generation_prompt=True, return_tensors='pt'
+                )
+            else:
+                input_context = context + question
+                input_ids = tokenizer(input_context, return_tensors="pt")['input_ids']
+            
+            # 运行推理
+            if isinstance(model_obj, CustomModelAdapter):
+                actual_model = model_obj._model
+                device = next(actual_model.parameters()).device
+            else:
+                actual_model = model_obj
+                device = next(actual_model.parameters()).device
+            
+            input_ids = input_ids.to(device)
+            
+            start_time = time.time()
+  
+            with torch.no_grad():
+                q_outputs = actual_model(input_ids=input_ids[:, :-1], use_cache=True, return_dict=True)
+                output = []
+                past_kv = q_outputs.past_key_values
+                inp = input_ids[:, -1]
+                
+                for step_i in range(max_new_tokens):
+                    inp = inp.view(1, 1)
+                    outputs = actual_model(
+                        input_ids=inp, past_key_values=past_kv, use_cache=True,
+                        output_attentions=False, block_list=block_list
+                    )
+                    past_kv = outputs.past_key_values
+                    inp = outputs.logits[0, -1].argmax()
+                    step_token = tokenizer.convert_ids_to_tokens(inp.item())
+                    output.append(inp.item())
+                    if step_token == '<0x0A>' or inp.item() == 144:
+                        break
+            
+            response = tokenizer.decode(output, skip_special_tokens=True).strip()
+            generation_time = time.time() - start_time
+            
+            # 计算性能指标
+            rouge_scores = scorer.score(ground_truth, response)
+            score = rouge_scores['rouge1'].recall * 100
+            
+            result = {
+                'context_length': int(context_length),
+                'depth_percent': float(depth_percent),
+                'score': score,
+                'response': response,
+                'generation_time': generation_time
+            }
+            all_results.append(result)
+            
+            print(f"  Score: {score:.2f}%")
+    
+    # 6. 计算统计信息
+    scores = [r['score'] for r in all_results]
+    average_score = np.mean(scores) if scores else 0
+    success_count = sum(1 for s in scores if s > 50)
+    
+    return {
+        'results': all_results,
+        'average_score': average_score,
+        'success_count': success_count,
+        'total_count': len(all_results),
+        'blocked_heads': blocked_heads
+    }

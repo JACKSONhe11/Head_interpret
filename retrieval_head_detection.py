@@ -170,8 +170,39 @@ class LLMNeedleHaystackTester:
         
         self.model_name = model_name
 
-        self.enc = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-        print(f"📦 Loading tokenizer from: {model_name}")
+        # 对于 Pythia 模型，使用 GPTNeoX tokenizer（Pythia 使用相同的 tokenizer）
+        # 检查是否是 Pythia 模型
+        is_pythia = "pythia" in model_name.lower()
+        
+        if is_pythia:
+            # Pythia 模型使用 GPTNeoX tokenizer
+            # 使用基础 tokenizer 模型，因为 Pythia 的 tokenizer 文件可能有问题
+            tokenizer_model = "EleutherAI/gpt-neox-20b"
+            print(f"📦 Detected Pythia model, using GPTNeoX tokenizer from: {tokenizer_model}")
+            try:
+                # 尝试使用 fast tokenizer
+                self.enc = AutoTokenizer.from_pretrained(tokenizer_model, use_fast=True)
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to load fast tokenizer: {e}")
+                try:
+                    # 回退到 slow tokenizer
+                    self.enc = AutoTokenizer.from_pretrained(tokenizer_model, use_fast=False)
+                except Exception as e2:
+                    print(f"⚠️  Warning: Failed to load slow tokenizer: {e2}")
+                    # 最后尝试直接从模型加载，但使用 use_fast=False
+                    print(f"   Trying to load tokenizer directly from model...")
+                    self.enc = AutoTokenizer.from_pretrained(model_name, use_fast=False, trust_remote_code=True)
+        else:
+            # 非 Pythia 模型，使用原来的逻辑
+            try:
+                self.enc = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+            except (ValueError, ImportError) as e:
+                # 如果 use_fast=False 失败，使用默认方式
+                print(f"⚠️  Warning: Failed to load tokenizer with use_fast=False: {e}")
+                print(f"   Falling back to default tokenizer loading...")
+                self.enc = AutoTokenizer.from_pretrained(model_name)
+        
+        print(f"✅ Tokenizer loaded successfully")
         config = AutoConfig.from_pretrained(model_name)
         self.layer_num, self.head_num = config.num_hidden_layers, config.num_attention_heads
         print(f"📊 Model config: {self.layer_num} layers, {self.head_num} heads per layer")
@@ -192,6 +223,16 @@ class LLMNeedleHaystackTester:
             self.model_to_test = Phi3ForCausalLM.from_pretrained(
                     model_name,torch_dtype="auto",device_map='auto',use_flash_attention_2="flash_attention_2",trust_remote_code=True,
                 ).eval()
+        elif is_pythia:
+            # Pythia 模型使用 AutoModelForCausalLM
+            # 注意：如果需要指定 revision（checkpoint），需要在 model_name 中指定或通过 revision 参数传递
+            print(f"📦 Loading Pythia model: {model_name}")
+            self.model_to_test = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                device_map='auto',
+                trust_remote_code=True
+            ).eval()
         else:
             self.model_to_test = LlamaForCausalLM.from_pretrained(model_name,
                 use_flash_attention_2="flash_attention_2", torch_dtype=torch.bfloat16,device_map='auto').eval()

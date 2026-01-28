@@ -182,15 +182,27 @@ def tokenized_tqa_gen(dataset, tokenizer):
 
 
 def get_llama_activations_bau(model, prompt, device): 
-    HEADS = [f"model.layers.{i}.self_attn.head_out" for i in range(model.config.num_hidden_layers)]
-    HEADS_O_PROJ = [f"model.layers.{i}.self_attn.o_proj" for i in range(model.config.num_hidden_layers)]
-    MLPS = [f"model.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)]
+    # 检测模型类型
+    model_type = getattr(model.config, 'model_type', None)
+    is_gptneox = model_type == 'gpt_neox' or 'gpt_neox' in str(type(model)).lower() or 'pythia' in str(type(model)).lower()
+    
+    # 根据模型类型设置层名称
+    if is_gptneox:
+        # GPTNeoX/Pythia 架构: gpt_neox.layers.{i}.attention.dense
+        HEADS = [f"gpt_neox.layers.{i}.attention.dense" for i in range(model.config.num_hidden_layers)]
+        HEADS_O_PROJ = HEADS  # GPTNeoX 使用 dense 作为输出投影
+        MLPS = [f"gpt_neox.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)]
+    else:
+        # LLaMA 架构
+        HEADS = [f"model.layers.{i}.self_attn.head_out" for i in range(model.config.num_hidden_layers)]
+        HEADS_O_PROJ = [f"model.layers.{i}.self_attn.o_proj" for i in range(model.config.num_hidden_layers)]
+        MLPS = [f"model.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)]
 
 
     with torch.no_grad():
         prompt = prompt.to(device)
         # 检查是否是自定义的 LlamaForCausalLM（来自 source.modeling_llama）
-        is_custom_llama = model.__class__.__name__ == "LlamaForCausalLM" and hasattr(model, 'model') and hasattr(model.model, 'layers')
+        is_custom_llama = not is_gptneox and model.__class__.__name__ == "LlamaForCausalLM" and hasattr(model, 'model') and hasattr(model.model, 'layers')
         use_attn_mode_torch = False
         if is_custom_llama:
             # 检查第一个 layer 是否有 attn_mode 参数支持
@@ -224,6 +236,7 @@ def get_llama_activations_bau(model, prompt, device):
             head_wise_hidden_states = torch.stack(head_wise_hidden_states, dim = 0).squeeze().float().numpy()
         except LookupError:
             # Llama 3 models do not expose self_attn.head_out; use o_proj input instead.
+            # GPTNeoX models also need to use dense input
             with TraceDict(model, HEADS_O_PROJ + MLPS, retain_input=True) as ret:
                 # 自定义模型：只有当 self_attn 是 LlamaFlashAttention2 时才使用 attn_mode="torch"
                 if is_custom_llama and use_attn_mode_torch:

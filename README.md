@@ -44,7 +44,7 @@ conda activate rh
 
 - `faiss_attn/source/` - 自定义模型实现
 - `data_cot/` - CoT 数据处理
-- `head_score_all/` - 检测结果保存目录
+- `head_score_all/` - 检测结果保存目录（默认）
 
 ## Head 类型选择
 
@@ -79,10 +79,16 @@ conda activate rh
 - **功能**: 能够区分真实答案和虚假答案
 - **检测方法**: 通过 TruthfulQA 数据集和逻辑回归探针检测
 - **适用场景**: 分析模型对真实性的判断能力
-- **注意**: 需要先运行激活值生成脚本
+- **注意**:
+  - 默认会在检测时生成并保存激活值（由 `--truth_get_activation` 控制）
+  - 激活值会保存到 `data_dir/truthfulness/<model_version>/` 下（`data_dir` 默认 `data_head`）
 
 ### 7. **all** - 检测所有类型
 - **功能**: 运行所有 head 类型的检测
+- **返回**: 字典格式，键为 head 类型，值为对应的 heads 列表
+
+### 8. **three** - 仅检测三类 Pattern Heads
+- **功能**: 只运行 `previous_token_head` / `duplicate_token_head` / `induction_head`
 - **返回**: 字典格式，键为 head 类型，值为对应的 heads 列表
 
 ## 模型选择
@@ -97,11 +103,15 @@ conda activate rh
 
 ### Pythia 系列模型
 
-支持使用 Pythia 模型和特定 checkpoint：
-
+支持使用 Pythia 模型以及（可选）指定 checkpoint revision：
 - **默认模型**: `EleutherAI/pythia-6.9b-deduped`
 - **支持的 checkpoint**: `step3000`, `step10000`, `step143000` 等
 - **使用方法**: 需要设置 `--use_pythia` 和 `--pythia_checkpoint` 参数
+
+- **内置快捷选择（当前脚本）**: `--model_index 3` 会使用 `ncgc/pythia-6.9b-sft`
+- **checkpoint 参数**: `--pythia_checkpoint`
+  - SFT 模型通常只支持 `main`，如果传了其它值会自动回退到 `main`
+  - 对于“原始 Pythia 模型”（如果你手动 `--model_name` 指向这类模型），一般需要显式指定 `stepXXXX`
 
 ## 运行代码
 
@@ -147,36 +157,22 @@ python head_recog.py \
     --save_path "head_score_all"
 ```
 
-#### 4. 使用 Pythia 模型检测 Iteration Head
+#### 4. 仅检测三类 Pattern Heads（Previous/Duplicate/Induction）
 
 ```bash
 python head_recog.py \
-    --use_pythia \
-    --pythia_model_name "EleutherAI/pythia-6.9b-deduped" \
-    --pythia_checkpoint "step3000" \
-    --head_type "iteration_head" \
+    --model_name "meta-llama/Llama-2-7b-hf" \
+    --head_type "three" \
     --save_path "head_score_all"
 ```
 
-#### 5. 检测 Pattern-based Heads（Previous Token, Duplicate, Induction）
+#### 5. 使用 Pythia（SFT）模型检测 Iteration Head
 
 ```bash
-# Previous Token Head
 python head_recog.py \
-    --model_name "meta-llama/Llama-2-7b-hf" \
-    --head_type "previous_token_head" \
-    --save_path "head_score_all"
-
-# Duplicate Token Head
-python head_recog.py \
-    --model_name "meta-llama/Llama-2-7b-hf" \
-    --head_type "duplicate_token_head" \
-    --save_path "head_score_all"
-
-# Induction Head
-python head_recog.py \
-    --model_name "meta-llama/Llama-2-7b-hf" \
-    --head_type "induction_head" \
+    --model_index 3 \
+    --pythia_checkpoint "main" \
+    --head_type "iteration_head" \
     --save_path "head_score_all"
 ```
 
@@ -197,9 +193,14 @@ python head_recog.py \
 #### 基本参数
 
 - `--model_name`: 模型名称（默认: `meta-llama/Meta-Llama-3-8B-Instruct`）
+- `--model_index`: 快捷选择模型（默认: 1）
+  - `1`: `meta-llama/Meta-Llama-3-8B-Instruct`
+  - `2`: `meta-llama/Llama-2-7b-hf`
+  - `3`: `ncgc/pythia-6.9b-sft`
 - `--head_type`: Head 类型（默认: `retrieval_head`）
 - `--save_path`: 结果保存路径（默认: `head_score_all`）
-- `--rerun` / `--no-rerun`: 是否重新运行（默认: `--rerun`）
+- `--rerun` / `--no-rerun`: 是否重新运行（默认会重新运行；如想复用已有结果，请用 `--no-rerun`）
+- `--data_dir`: truthfulness 激活值保存根目录（默认: `data_head`）
 
 #### Retrieval Head 参数
 
@@ -215,16 +216,27 @@ python head_recog.py \
 - `--num_heads`: 选择的 top heads 数量（默认: 100）
 - `--seed`: 随机种子（默认: 42）
 - `--val_ratio`: 验证集比例（默认: 0.2）
+- `--truth_get_activation`: 是否在检测时生成并保存激活值（默认: True）
+- `--use_center_of_mass`: 使用 center-of-mass 方向（默认: False）
+- `--use_random_dir`: 使用随机方向（默认: False）
 
 #### Pythia 模型参数
 
-- `--use_pythia`: 使用 Pythia 模型（需要与 `--pythia_checkpoint` 一起使用）
-- `--pythia_model_name`: Pythia 模型名称（默认: `EleutherAI/pythia-6.9b-deduped`）
-- `--pythia_checkpoint`: Pythia checkpoint revision（例如: `step3000`, `step10000`）
+- `--pythia_checkpoint`: Pythia checkpoint revision（例如: `step3000`, `step10000`, `step143000`, `main`）
+  - 如果使用 `--model_index 3`（SFT），推荐用 `main`
+  - 如果你手动指定了“原始 Pythia 模型”的 `--model_name`，通常需要显式提供 `stepXXXX`
+
+#### Prompt 生成参数（Pattern Heads）
+
+- `--use_prompt_generator` / `--no_use_prompt_generator`: 是否使用 `promt_generate.py` 生成 prompts（默认: 使用）
+- `--prompt_max_length`: 生成 prompt 的最大长度（默认: 200）
+- `--prompt_min_length`: 生成 prompt 的最小长度（默认: 10）
+- `--prompt_interval`: prompt 长度间隔（默认: 10）
+- `--prompt_length_per_interval`: 每个长度区间生成多少条 prompt（默认: 10）
 
 ### 输出结果
 
-检测结果会保存在 `save_path` 目录下，按模型名称组织：
+检测结果会保存在 `save_path/<model_version>/` 目录下（脚本会自动在 `save_path` 下创建模型子目录）：
 
 ```
 head_score_all/
@@ -234,9 +246,20 @@ head_score_all/
 │   ├── Llama-2-7b-hf_duplicate_token_head_custom_abs.pt
 │   ├── Llama-2-7b-hf_induction_head_custom_abs.pt
 │   └── ...
-└── pythia-6.9b-deduped/
-    ├── pythia-6.9b-deduped_iteration_heads_inv_gt_0.70_sorted.npy
+└── pythia-6.9b-sft/
+    ├── pythia-6.9b-sft_iteration_heads_inv_gt_0.70_sorted.npy
     └── ...
+```
+
+Truthfulness 相关激活值会保存在（默认）：
+
+```
+data_head/
+└── truthfulness/
+    └── <model_version>/
+        ├── <model_version>_<dataset_name>_labels.npy
+        ├── <model_version>_<dataset_name>_layer_wise.npy
+        └── <model_version>_<dataset_name>_head_wise.npy
 ```
 
 ### 在 Python 代码中使用

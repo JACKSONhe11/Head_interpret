@@ -106,7 +106,31 @@ class CustomModelAdapter:
                     raise ValueError(
                         "无法自动推断 tokenizer 名称。请提供 tokenizer 参数。"
                     )
-            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            # 对于 Pythia 模型，使用 GPTNeoX tokenizer（Pythia 使用相同的 tokenizer）
+            is_pythia = "pythia" in model_name.lower()
+            
+            if is_pythia:
+                # Pythia 模型使用 GPTNeoX tokenizer
+                # 使用基础 tokenizer 模型，因为 Pythia 的 tokenizer 文件可能有问题
+                tokenizer_model = "EleutherAI/gpt-neox-20b"
+                print(f"📦 Detected Pythia model, using GPTNeoX tokenizer from: {tokenizer_model}")
+                try:
+                    # 尝试使用 fast tokenizer
+                    self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, use_fast=True)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to load fast tokenizer: {e}")
+                    try:
+                        # 回退到 slow tokenizer
+                        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_model, use_fast=False)
+                    except Exception as e2:
+                        print(f"⚠️  Warning: Failed to load slow tokenizer: {e2}")
+                        # 最后尝试直接从模型加载，但使用 use_fast=False
+                        print(f"   Trying to load tokenizer directly from model...")
+                        self._tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, trust_remote_code=True)
+            else:
+                # 非 Pythia 模型，使用原来的逻辑
+                self._tokenizer = AutoTokenizer.from_pretrained(model_name)
         else:
             self._tokenizer = tokenizer
         
