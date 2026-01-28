@@ -284,27 +284,16 @@ def detect_heads(model_name: str, head_type: str, save_path: str = "head_score",
 
     elif head_type == "all":
         # 运行所有 head 类型的检测
-        if args.model_index == 3:
-            
-            all_head_types = [
-    
-                "previous_token_head",
-                "duplicate_token_head",
-                "induction_head",
-                "iteration_head",
-                "truthfulness_head",
-                # "retrieval_head",
-            ]
-        else:
-            all_head_types = [
 
-                "previous_token_head",
-                "duplicate_token_head",
-                "induction_head",
-                "iteration_head",
-                "truthfulness_head",
-                "retrieval_head",
-            ]
+        all_head_types = [
+
+            "previous_token_head",
+            "duplicate_token_head",
+            "induction_head",
+            "iteration_head",
+            "truthfulness_head",
+            # "retrieval_head",
+        ]
 
         
         results = {}
